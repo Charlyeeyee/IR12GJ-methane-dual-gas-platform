@@ -10,7 +10,7 @@ Expected input columns:
     - NA_avg
 
 Default input file:
-    data/Gas_callibration_data_all_git.xlsx
+    data/Gas_calibration_data_all_git.xlsx
 
 Default worksheet:
     Feb23_mod
@@ -19,12 +19,12 @@ Main output:
     outputs/calibration_fit_and_residuals_side_by_side.pdf
 
 To run:
-    python curvefit_fixedSpan_1plot.py
+    python curvefit_fixedSpan.py
 
 Optional examples:
-    python curvefit_fixedSpan_1plot.py --show
-    python curvefit_fixedSpan_1plot.py --sheet Feb23_mod
-    python curvefit_fixedSpan_1plot.py --span 0.36154
+    python curvefit_fixedSpan.py --show
+    python curvefit_fixedSpan.py --sheet Feb23_mod
+    python curvefit_fixedSpan.py --span 0.36154
 """
 
 from pathlib import Path
@@ -33,8 +33,8 @@ import sys
 
 import matplotlib
 
-# Use a non-interactive backend so the script works on a marker's machine,
-# GitHub Codespaces, or a terminal without a display.
+# Use a non-interactive backend so the script works from a terminal,
+# GitHub Codespaces, or another environment without a graphical display.
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -48,9 +48,15 @@ from scipy.optimize import curve_fit
 # =============================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_FILE = BASE_DIR / "data" / "Gas_callibration_data_all_git.xlsx"
+
+# Excel workbook containing the processed calibration data.
+# The workbook should be stored in the data folder beside this script.
+DEFAULT_DATA_FILE = BASE_DIR / "data" / "Gas_calibration_data_all_git.xlsx"
+
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
 
+# Select the Excel worksheet containing the calibration data to be fitted.
+# Change this value to use a different processed calibration sheet.
 DEFAULT_SHEET = "Feb23_mod"
 
 # pandas uses zero-based indexing, so 11 corresponds to Excel row 12.
@@ -221,11 +227,14 @@ def load_calibration_data(
             f"Available columns are: {list(df.columns)}"
         )
 
-    # Keep only the required columns.
+    # Keep only the columns required for curve fitting.
     df = df[["Concentration (%vol)", "NA_avg"]].copy()
 
     # Convert to numeric. Non-numeric cells become NaN and are removed.
-    df["Concentration (%vol)"] = pd.to_numeric(df["Concentration (%vol)"], errors="coerce")
+    df["Concentration (%vol)"] = pd.to_numeric(
+        df["Concentration (%vol)"],
+        errors="coerce",
+    )
     df["NA_avg"] = pd.to_numeric(df["NA_avg"], errors="coerce")
 
     # Remove infinities and incomplete rows.
