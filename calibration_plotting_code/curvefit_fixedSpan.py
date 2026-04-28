@@ -1,359 +1,543 @@
 """
-Fixed-SPAN methane sensor calibration curve fitting script.
+Fixed-SPAN methane sensor calibration curve-fitting script.
 
-This script loads processed calibration data from an Excel worksheet,
-fits the modified Beer-Lambert response model with a fixed SPAN value,
-calculates fit-quality metrics, and generates a side-by-side calibration
-and residual plot.
+This script loads processed calibration data from an Excel worksheet, fits the
+modified Beer-Lambert response model with a fixed SPAN value, calculates
+fit-quality metrics, and generates a side-by-side calibration and residual plot.
 
 Expected input columns:
     - Concentration (%vol)
     - NA_avg
 
+Default input file:
+    data/Gas_callibration_data_all_git.xlsx
+
+Default worksheet:
+    Feb23_mod
+
 Main output:
-    - calibration_fit_and_residuals_side_by_side.pdf
+    outputs/calibration_fit_and_residuals_side_by_side.pdf
+
+To run:
+    python curvefit_fixedSpan_1plot.py
+
+Optional examples:
+    python curvefit_fixedSpan_1plot.py --show
+    python curvefit_fixedSpan_1plot.py --sheet Feb23_mod
+    python curvefit_fixedSpan_1plot.py --span 0.36154
 """
 
+from pathlib import Path
+import argparse
+import sys
+
+import matplotlib
+
+# Use a non-interactive backend so the script works on a marker's machine,
+# GitHub Codespaces, or a terminal without a display.
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
 
 # =============================================================================
-# USER SETTINGS
+# DEFAULT SETTINGS
 # =============================================================================
 
-# Excel workbook containing the processed calibration data
-FILE_NAME = "Gas_callibration_data_all.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_FILE = BASE_DIR / "data" / "Gas_callibration_data_all_git.xlsx"
+DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
 
-# Worksheet containing the calibration dataset to be fitted
-SHEET = "Feb23_mod"
+DEFAULT_SHEET = "Feb23_mod"
 
-# Row number used by pandas as the column-header row
-# Note: pandas uses zero-based indexing, so this corresponds to Excel row 12
-HEADER_ROW = 11
+# pandas uses zero-based indexing, so 11 corresponds to Excel row 12.
+DEFAULT_HEADER_ROW = 11
 
-# Fixed SPAN value determined experimentally from pure-methane exposure
-SPAN_FIXED = 0.36154
+# Fixed SPAN value determined experimentally from pure-methane exposure.
+DEFAULT_SPAN_FIXED = 0.36154
 
-# Optional figure title; set to None to omit a title
-FIGURE_TITLE = None
+DEFAULT_OUTPUT_FILE = "calibration_fit_and_residuals_side_by_side.pdf"
 
-# Output filename for the combined calibration and residual figure
-COMBINED_FIGURE_FILE = "calibration_fit_and_residuals_side_by_side.pdf"
-
-# Set True to generate the residual subplot alongside the calibration plot
-PLOT_RESIDUALS = True
+REQUIRED_COLUMNS = {"Concentration (%vol)", "NA_avg"}
 
 
 # =============================================================================
-# PLOT STYLE
+# COMMAND-LINE ARGUMENTS
 # =============================================================================
 
-# Configure global Matplotlib settings for report-ready figure formatting
-plt.rcParams.update({
-    "font.family": "sans-serif",
-    "font.size": 18,
-    "axes.labelsize": 20,
-    "axes.titlesize": 20,
-    "xtick.labelsize": 18,
-    "ytick.labelsize": 18,
-    "legend.fontsize": 18
-})
+def parse_arguments() -> argparse.Namespace:
+    """Parse optional command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fit the modified Beer-Lambert methane calibration model "
+            "using processed calibration data and a fixed SPAN value."
+        )
+    )
+
+    parser.add_argument(
+        "--file",
+        type=Path,
+        default=DEFAULT_DATA_FILE,
+        help=f"Path to the Excel workbook. Default: {DEFAULT_DATA_FILE}",
+    )
+
+    parser.add_argument(
+        "--sheet",
+        type=str,
+        default=DEFAULT_SHEET,
+        help=f"Worksheet name to load. Default: {DEFAULT_SHEET}",
+    )
+
+    parser.add_argument(
+        "--header-row",
+        type=int,
+        default=DEFAULT_HEADER_ROW,
+        help=(
+            "Zero-based row index used as the column-header row. "
+            f"Default: {DEFAULT_HEADER_ROW}"
+        ),
+    )
+
+    parser.add_argument(
+        "--span",
+        type=float,
+        default=DEFAULT_SPAN_FIXED,
+        help=f"Fixed SPAN value used in the fitted model. Default: {DEFAULT_SPAN_FIXED}",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Directory where output files are saved. Default: {DEFAULT_OUTPUT_DIR}",
+    )
+
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=DEFAULT_OUTPUT_FILE,
+        help=f"Output PDF filename. Default: {DEFAULT_OUTPUT_FILE}",
+    )
+
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Display the figure interactively after saving.",
+    )
+
+    return parser.parse_args()
 
 
 # =============================================================================
 # MODEL DEFINITION
 # =============================================================================
 
-def model_fixed_span(c, a, n):
+def model_fixed_span(c: np.ndarray, a: float, n: float, span_fixed: float) -> np.ndarray:
     """
     Modified Beer-Lambert response model with fixed SPAN.
 
     Parameters
     ----------
-    c : array-like
+    c : np.ndarray
         Methane concentration in % v/v.
     a : float
         Linearisation coefficient fitted from calibration data.
     n : float
         Exponent coefficient fitted from calibration data.
+    span_fixed : float
+        Experimentally determined fixed SPAN value.
 
     Returns
     -------
-    array-like
+    np.ndarray
         Predicted normalised absorbance.
     """
-    return SPAN_FIXED * (1 - np.exp(-a * c**n))
+    return span_fixed * (1.0 - np.exp(-a * c**n))
 
 
-# Initial parameter guesses for non-linear curve fitting:
-# a and n are started close to expected methane sensor values.
-p0 = [0.3, 0.7]
+def make_curve_fit_model(span_fixed: float):
+    """
+    Create a two-parameter model function for scipy.curve_fit.
 
-# Lower and upper bounds for fitted parameters [a, n].
-# These prevent the optimiser from selecting non-physical negative values.
-bounds = ([0.0, 0.0], [5.0, 2.0])
+    The SPAN value is fixed, while a and n are fitted.
+    """
+    def fitted_model(c: np.ndarray, a: float, n: float) -> np.ndarray:
+        return model_fixed_span(c, a, n, span_fixed)
 
-
-# =============================================================================
-# LOAD AND PREPARE DATA
-# =============================================================================
-
-# Load the selected worksheet from the Excel workbook
-df = pd.read_excel(FILE_NAME, sheet_name=SHEET, header=HEADER_ROW)
-
-# Remove leading/trailing spaces from column names to avoid matching errors
-df.columns = df.columns.str.strip()
-
-# Define the required input columns
-required = {"Concentration (%vol)", "NA_avg"}
-
-# Check whether any required columns are missing from the worksheet
-missing = required - set(df.columns)
-if missing:
-    raise ValueError(f"Missing columns in sheet '{SHEET}': {missing}")
-
-# Keep only the columns needed for curve fitting
-df = df[["Concentration (%vol)", "NA_avg"]].copy()
-
-# Replace infinite values with NaN, then remove incomplete rows
-df = df.replace([np.inf, -np.inf], np.nan).dropna()
-
-# Convert concentration and normalised absorbance columns to NumPy arrays
-c_data = df["Concentration (%vol)"].astype(float).to_numpy()
-y_data = df["NA_avg"].astype(float).to_numpy()
-
-# Require at least three valid points to fit a two-parameter model sensibly
-if len(c_data) < 3:
-    raise ValueError("Not enough valid data points for curve fitting.")
-
-# Sort data by concentration so the plot and fitted curve are ordered clearly
-sort_idx = np.argsort(c_data)
-c_data = c_data[sort_idx]
-y_data = y_data[sort_idx]
+    return fitted_model
 
 
 # =============================================================================
-# CURVE FITTING
+# DATA LOADING
 # =============================================================================
 
-# Fit the fixed-SPAN model to the calibration data.
-# popt contains the best-fit parameters [a, n].
-# pcov is the covariance matrix estimated by scipy.
-popt, pcov = curve_fit(
-    model_fixed_span,
-    c_data,
-    y_data,
-    p0=p0,
-    bounds=bounds,
-    maxfev=50000
-)
+def load_calibration_data(
+    file_path: Path,
+    sheet_name: str,
+    header_row: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load and clean processed calibration data from an Excel worksheet.
 
-# Extract fitted coefficients
-a_fit, n_fit = popt
+    Parameters
+    ----------
+    file_path : Path
+        Path to the Excel workbook.
+    sheet_name : str
+        Worksheet name.
+    header_row : int
+        Zero-based row index containing column headers.
 
-# Estimate standard errors from the diagonal of the covariance matrix
-param_se = np.sqrt(np.diag(pcov))
-a_se, n_se = param_se
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Concentration data and measured normalised absorbance data.
+    """
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Input Excel file was not found:\n{file_path}\n\n"
+            "Check that the workbook is in the expected data folder, or use "
+            "the --file argument to specify its location."
+        )
+
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
+    except ValueError as exc:
+        raise ValueError(
+            f"Could not load worksheet '{sheet_name}' from:\n{file_path}\n\n"
+            "Check that the sheet name is correct."
+        ) from exc
+
+    # Remove leading/trailing spaces from column names to avoid matching errors.
+    df.columns = df.columns.astype(str).str.strip()
+
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Missing required columns in sheet '{sheet_name}': {missing}\n"
+            f"Available columns are: {list(df.columns)}"
+        )
+
+    # Keep only the required columns.
+    df = df[["Concentration (%vol)", "NA_avg"]].copy()
+
+    # Convert to numeric. Non-numeric cells become NaN and are removed.
+    df["Concentration (%vol)"] = pd.to_numeric(df["Concentration (%vol)"], errors="coerce")
+    df["NA_avg"] = pd.to_numeric(df["NA_avg"], errors="coerce")
+
+    # Remove infinities and incomplete rows.
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(df) < 3:
+        raise ValueError(
+            "Not enough valid data points for curve fitting. "
+            "At least three valid rows are required."
+        )
+
+    c_data = df["Concentration (%vol)"].to_numpy(dtype=float)
+    y_data = df["NA_avg"].to_numpy(dtype=float)
+
+    # Sort by concentration for clearer plotting.
+    sort_idx = np.argsort(c_data)
+    c_data = c_data[sort_idx]
+    y_data = y_data[sort_idx]
+
+    return c_data, y_data
 
 
 # =============================================================================
-# GOODNESS-OF-FIT CALCULATIONS
+# FITTING AND METRICS
 # =============================================================================
 
-# Calculate fitted model values at the measured concentration points
-y_pred = model_fixed_span(c_data, a_fit, n_fit)
+def fit_calibration_model(
+    c_data: np.ndarray,
+    y_data: np.ndarray,
+    span_fixed: float,
+) -> dict:
+    """
+    Fit the fixed-SPAN calibration model and calculate fit metrics.
 
-# Residuals are measured normalised absorbance minus fitted absorbance
-residuals = y_data - y_pred
+    Parameters
+    ----------
+    c_data : np.ndarray
+        Methane concentration data in % v/v.
+    y_data : np.ndarray
+        Measured normalised absorbance data.
+    span_fixed : float
+        Fixed SPAN value.
 
-# Residual sum of squares
-ss_res = np.sum(residuals**2)
+    Returns
+    -------
+    dict
+        Fitted coefficients, uncertainties, predictions, residuals and metrics.
+    """
+    fit_model = make_curve_fit_model(span_fixed)
 
-# Total sum of squares relative to the mean measured absorbance
-ss_tot = np.sum((y_data - np.mean(y_data))**2)
+    # Initial parameter guesses for [a, n].
+    p0 = [0.3, 0.7]
 
-# Coefficient of determination, R²
-r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else np.nan
+    # Bounds prevent non-physical negative values.
+    bounds = ([0.0, 0.0], [5.0, 2.0])
 
-# Root mean square error of normalised absorbance
-rmse = np.sqrt(np.mean(residuals**2))
-
-# Mean absolute error of normalised absorbance
-mae = np.mean(np.abs(residuals))
-
-
-# =============================================================================
-# GENERATE SMOOTH FITTED CURVE
-# =============================================================================
-
-# Generate evenly spaced concentration values for plotting the fitted curve
-c_fit = np.linspace(0, np.max(c_data), 500)
-
-# Evaluate the fitted model over the smooth concentration range
-y_fit = model_fixed_span(c_fit, a_fit, n_fit)
-
-
-# =============================================================================
-# CREATE FIGURE
-# =============================================================================
-
-# Create either a side-by-side calibration/residual figure or a single fit plot
-if PLOT_RESIDUALS:
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.6), dpi=200)
-else:
-    fig, ax1 = plt.subplots(1, 1, figsize=(14, 5.6), dpi=200)
-
-
-# =============================================================================
-# MAIN CALIBRATION FIT PLOT
-# =============================================================================
-
-# Plot measured calibration data
-ax1.scatter(
-    c_data,
-    y_data,
-    s=12,
-    alpha=0.8,
-    label="Data"
-)
-
-# Plot fitted fixed-SPAN model curve
-ax1.plot(
-    c_fit,
-    y_fit,
-    color="darkred",
-    linewidth=2.0,
-    label="Fit"
-)
-
-# Add axis labels
-ax1.set_xlabel("Concentration (% v/v)")
-ax1.set_ylabel("Normalised Absorbance")
-
-# Add grid and legend for readability
-ax1.grid(True, linestyle="--", alpha=0.35)
-ax1.legend(frameon=True, loc="lower right")
-
-# Text box summarising fitted parameters and fit quality
-param_text = (
-    f"a = {a_fit:.6f}\n"
-    f"n = {n_fit:.6f}\n"
-    f"R² = {r2:.6f}\n"
-    f"RMSE = {rmse:.6f}"
-)
-
-# Add the parameter text box to the calibration plot
-ax1.text(
-    0.03, 0.97,
-    param_text,
-    transform=ax1.transAxes,
-    fontsize=18,
-    verticalalignment="top",
-    bbox=dict(
-        boxstyle="round,pad=0.35",
-        facecolor="white",
-        edgecolor="0.6",
-        alpha=0.95
+    popt, pcov = curve_fit(
+        fit_model,
+        c_data,
+        y_data,
+        p0=p0,
+        bounds=bounds,
+        maxfev=50000,
     )
-)
+
+    a_fit, n_fit = popt
+
+    if pcov is None or not np.all(np.isfinite(pcov)):
+        a_se, n_se = np.nan, np.nan
+    else:
+        param_se = np.sqrt(np.diag(pcov))
+        a_se, n_se = param_se
+
+    y_pred = fit_model(c_data, a_fit, n_fit)
+    residuals = y_data - y_pred
+
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((y_data - np.mean(y_data))**2)
+
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot != 0 else np.nan
+    rmse = np.sqrt(np.mean(residuals**2))
+    mae = np.mean(np.abs(residuals))
+
+    return {
+        "a_fit": a_fit,
+        "n_fit": n_fit,
+        "a_se": a_se,
+        "n_se": n_se,
+        "y_pred": y_pred,
+        "residuals": residuals,
+        "r2": r2,
+        "rmse": rmse,
+        "mae": mae,
+        "fit_model": fit_model,
+    }
 
 
 # =============================================================================
-# RESIDUAL PLOT
+# PLOTTING
 # =============================================================================
 
-if PLOT_RESIDUALS:
-    # Plot residuals against methane concentration
+def configure_plot_style() -> None:
+    """Apply report-ready Matplotlib formatting."""
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.size": 18,
+        "axes.labelsize": 20,
+        "axes.titlesize": 20,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+        "legend.fontsize": 18,
+    })
+
+
+def create_calibration_figure(
+    c_data: np.ndarray,
+    y_data: np.ndarray,
+    fit_results: dict,
+    span_fixed: float,
+    output_path: Path,
+    show_figure: bool = False,
+) -> None:
+    """
+    Create and save the calibration fit and residual figure.
+
+    Parameters
+    ----------
+    c_data : np.ndarray
+        Methane concentration data in % v/v.
+    y_data : np.ndarray
+        Measured normalised absorbance data.
+    fit_results : dict
+        Dictionary returned by fit_calibration_model().
+    span_fixed : float
+        Fixed SPAN value.
+    output_path : Path
+        Full path where the PDF figure will be saved.
+    show_figure : bool
+        If True, display the figure interactively after saving.
+    """
+    configure_plot_style()
+
+    a_fit = fit_results["a_fit"]
+    n_fit = fit_results["n_fit"]
+    residuals = fit_results["residuals"]
+    r2 = fit_results["r2"]
+    rmse = fit_results["rmse"]
+    fit_model = fit_results["fit_model"]
+
+    c_fit = np.linspace(0.0, np.max(c_data), 500)
+    y_fit = fit_model(c_fit, a_fit, n_fit)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.6), dpi=200)
+
+    # Main calibration fit plot.
+    ax1.scatter(
+        c_data,
+        y_data,
+        s=12,
+        alpha=0.8,
+        label="Data",
+    )
+
+    ax1.plot(
+        c_fit,
+        y_fit,
+        color="darkred",
+        linewidth=2.0,
+        label="Fit",
+    )
+
+    ax1.set_xlabel("Concentration (% v/v)")
+    ax1.set_ylabel("Normalised Absorbance")
+    ax1.grid(True, linestyle="--", alpha=0.35)
+    ax1.legend(frameon=True, loc="lower right")
+
+    param_text = (
+        f"SPAN = {span_fixed:.5f}\n"
+        f"a = {a_fit:.6f}\n"
+        f"n = {n_fit:.6f}\n"
+        f"R² = {r2:.6f}\n"
+        f"RMSE = {rmse:.6f}"
+    )
+
+    ax1.text(
+        0.03,
+        0.97,
+        param_text,
+        transform=ax1.transAxes,
+        fontsize=18,
+        verticalalignment="top",
+        bbox=dict(
+            boxstyle="round,pad=0.35",
+            facecolor="white",
+            edgecolor="0.6",
+            alpha=0.95,
+        ),
+    )
+
+    # Residual plot.
     ax2.scatter(
         c_data,
         residuals,
         s=12,
         alpha=0.8,
-        label="Residuals"
+        label="Residuals",
     )
 
-    # Add horizontal zero-residual reference line
     ax2.axhline(
-        0,
+        0.0,
         color="darkred",
         linewidth=1.6,
-        label="Residual = 0"
+        label="Residual = 0",
     )
 
-    # Add axis labels
     ax2.set_xlabel("Concentration (% v/v)")
     ax2.set_ylabel("Residual (NA)")
-
-    # Add grid and legend
     ax2.grid(True, linestyle="--", alpha=0.35)
     ax2.legend(frameon=True, loc="upper right")
 
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.20)
 
-# =============================================================================
-# FINAL FIGURE FORMATTING
-# =============================================================================
+    ax1.text(
+        0.5,
+        -0.17,
+        "(a)",
+        transform=ax1.transAxes,
+        ha="center",
+        va="top",
+        fontsize=18,
+    )
 
-# Add an overall figure title only if one has been provided
-if FIGURE_TITLE is not None:
-    fig.suptitle(FIGURE_TITLE)
-
-# Automatically adjust subplot spacing
-fig.tight_layout()
-
-# Leave additional bottom margin for subplot labels "(a)" and "(b)"
-fig.subplots_adjust(bottom=0.20)
-
-# Add subplot label for the calibration plot
-ax1.text(
-    0.5, -0.17, "(a)",
-    transform=ax1.transAxes,
-    ha="center",
-    va="top",
-    fontsize=18
-)
-
-# Add subplot label for the residual plot, if present
-if PLOT_RESIDUALS:
     ax2.text(
-        0.5, -0.17, "(b)",
+        0.5,
+        -0.17,
+        "(b)",
         transform=ax2.transAxes,
         ha="center",
         va="top",
-        fontsize=18
+        fontsize=18,
     )
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, bbox_inches="tight")
 
-# =============================================================================
-# SAVE AND DISPLAY FIGURE
-# =============================================================================
-
-# Save the figure as a PDF with tight bounding box for report use
-fig.savefig(COMBINED_FIGURE_FILE, bbox_inches="tight")
-
-# Display the figure interactively
-plt.show()
+    if show_figure:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 # =============================================================================
-# PRINT NUMERICAL RESULTS
+# MAIN PROGRAM
 # =============================================================================
 
-# Print fitted model parameters
-print("\n=== Fitted Parameters ===")
-print(f"Sheet: {SHEET}")
-print(f"SPAN (fixed) = {SPAN_FIXED:.5f}")
-print(f"a = {a_fit:.6f} ± {a_se:.6f}")
-print(f"n = {n_fit:.6f} ± {n_se:.6f}")
+def main() -> int:
+    """Run the full calibration fitting workflow."""
+    args = parse_arguments()
 
-# Print goodness-of-fit metrics
-print("\n=== Goodness of Fit ===")
-print(f"R^2  = {r2:.6f}")
-print(f"RMSE = {rmse:.6f}")
-print(f"MAE  = {mae:.6f}")
+    input_file = args.file.resolve()
+    output_dir = args.output_dir.resolve()
+    output_path = output_dir / args.output_file
 
-# Print output file location/name
-print("\n=== Output File ===")
-print(f"Combined figure saved as: {COMBINED_FIGURE_FILE}")
+    try:
+        c_data, y_data = load_calibration_data(
+            file_path=input_file,
+            sheet_name=args.sheet,
+            header_row=args.header_row,
+        )
+
+        fit_results = fit_calibration_model(
+            c_data=c_data,
+            y_data=y_data,
+            span_fixed=args.span,
+        )
+
+        create_calibration_figure(
+            c_data=c_data,
+            y_data=y_data,
+            fit_results=fit_results,
+            span_fixed=args.span,
+            output_path=output_path,
+            show_figure=args.show,
+        )
+
+    except Exception as exc:
+        print("\nERROR: Calibration fitting failed.", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print("\n=== Input Data ===")
+    print(f"Workbook: {input_file}")
+    print(f"Sheet: {args.sheet}")
+    print(f"Header row used by pandas: {args.header_row}")
+    print(f"Valid data points: {len(c_data)}")
+
+    print("\n=== Fitted Parameters ===")
+    print(f"SPAN fixed = {args.span:.5f}")
+    print(f"a = {fit_results['a_fit']:.6f} ± {fit_results['a_se']:.6f}")
+    print(f"n = {fit_results['n_fit']:.6f} ± {fit_results['n_se']:.6f}")
+
+    print("\n=== Goodness of Fit ===")
+    print(f"R^2  = {fit_results['r2']:.6f}")
+    print(f"RMSE = {fit_results['rmse']:.6f}")
+    print(f"MAE  = {fit_results['mae']:.6f}")
+
+    print("\n=== Output File ===")
+    print(f"Combined figure saved as: {output_path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
